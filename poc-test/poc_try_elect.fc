@@ -1,0 +1,200 @@
+#pragma version >=0.2.0;
+
+;; Simplified PoC for elector-code.fc try_elect vulnerability
+;; This isolates the core logic responsible for the fund loss when stake > max_stake
+
+;; Standard udict methods are mostly in stdlib.fc, but some aren't in older stdlibs.
+;; They are provided by compiling stdlib.fc first.
+
+(slice, slice, int) dict::delete_get_min(cell dict, int key_len) asm(dict key_len) "DICTREMMIN" "NULLSWAPIFNOT" "NULLSWAPIFNOT";
+
+;; (var, tuple) uncons(var l) asm "UNCONS";
+;; var cons(var hd, var tl) asm "CONS";
+;; var car(var l) asm "CAR";
+;; var cdr(var l) asm "CDR";
+
+;; We can't use INDEXVAR with LISP list tuples, we need a custom getter
+var get_tuple_at(var tup, int i) {
+  repeat (i) { tup = cdr(tup); }
+  return car(tup);
+}
+
+_ ~credit_to(cell credits, int addr, int amount) inline_ref {
+  var (val, f) = credits.udict_get?(256, addr);
+  if (f) {
+    amount += val~load_grams();
+  }
+  credits~udict_set_builder(256, addr, begin_cell().store_grams(amount));
+  return (credits, ());
+}
+
+_ compute_total_stake(tuple l, int n, int m_stake) inline_ref {
+  int tot_stake = 0;
+  repeat (n) {
+    (var h, l) = uncons(l);
+    var stake = h.get_tuple_at(0);
+    var max_f = h.get_tuple_at(1);
+    stake = min(stake, (max_f * m_stake) >> 16);
+    tot_stake += stake;
+  }
+  return tot_stake;
+}
+
+(cell, cell, int, cell, int, int) try_elect(cell credits, cell members, int min_stake, int max_stake, int min_total_stake, int max_stake_factor) {
+  int max_validators = 100;
+  int min_validators = 1;
+  int n = 0;
+  var sdict = new_dict();
+  var pubkey = -1;
+  do {
+    (pubkey, var cs, var f) = members.udict_get_next?(256, pubkey);
+    if (f) {
+      var (stake, time, max_factor, addr, adnl_addr) = (cs~load_grams(), cs~load_uint(32), cs~load_uint(32), cs~load_uint(256), cs~load_uint(256));
+      cs.end_parse();
+      var key = begin_cell()
+        .store_uint(stake, 128)
+        .store_int(- time, 32)
+        .store_uint(pubkey, 256)
+      .end_cell().begin_parse();
+      sdict~dict_set_builder(128 + 32 + 256, key, begin_cell()
+          .store_uint(min(max_factor, max_stake_factor), 32)
+          .store_uint(addr, 256)
+          .store_uint(adnl_addr, 256));
+      n += 1;
+    }
+  } until (~ f);
+  n = min(n, max_validators);
+  if (n < min_validators) {
+    return (credits, new_dict(), 0, new_dict(), 0, 0);
+  }
+  tuple l = null();
+  do {
+    var (key, cs, f) = sdict~dict::delete_get_min(128 + 32 + 256);
+    if (f) {
+      var (stake, _, pubkey) = (min(key~load_uint(128), max_stake), key~load_uint(32), key.preload_uint(256));
+      var (max_f, _, adnl_addr) = (cs~load_uint(32), cs~load_uint(256), cs.preload_uint(256));
+      var tup = cons(stake, cons(max_f, cons(pubkey, cons(adnl_addr, null()))));
+      l = cons(tup, l);
+    }
+  } until (~ f);
+
+  int i = min_validators - 1;
+  var l1 = l;
+  repeat (i) {
+    l1 = cdr(l1);
+  }
+  var (best_stake, m) = (0, 0);
+  do {
+    var h = car(l1);
+    var stake = h.get_tuple_at(0);
+    l1 = cdr(l1);
+    i += 1;
+    if (stake >= min_stake) {
+      var tot_stake = compute_total_stake(l, i, stake);
+      if (tot_stake > best_stake) {
+        (best_stake, m) = (tot_stake, i);
+      }
+    }
+  } until (i >= n);
+  if ((m == 0) | (best_stake < min_total_stake)) {
+    return (credits, new_dict(), 0, new_dict(), 0, 0);
+  }
+  l1 = l; ;; removed touch
+  repeat (m - 1) {
+    l1 = cdr(l1);
+  }
+  var hm = car(l1);
+  var m_stake = hm.get_tuple_at(0);
+
+  i = 0;
+  var tot_stake = 0;
+  var tot_weight = 0;
+  var vset = new_dict();
+  var frozen = new_dict();
+  do {
+    var (h, l_next) = uncons(l);
+    l = l_next;
+    var stake = h.get_tuple_at(0);
+    var max_f = h.get_tuple_at(1);
+    var pubkey = h.get_tuple_at(2);
+    var adnl_addr = h.get_tuple_at(3);
+
+    var (val, f) = members.udict_get?(256, pubkey);
+    throw_unless(61, f);
+    (_, _, var src_addr) = (val~load_grams(), val~load_uint(64), val.preload_uint(256));
+    if (i < m) {
+      var true_stake = min(stake, (max_f * m_stake) >> 16);
+      stake -= true_stake;
+      var weight = (true_stake << 60) / best_stake;
+      tot_stake += true_stake;
+      tot_weight += weight;
+
+      frozen~udict_set_builder(256, pubkey, begin_cell()
+        .store_uint(src_addr, 256)
+        .store_uint(weight, 64)
+        .store_grams(true_stake)
+        .store_int(false, 1));
+    }
+    if (stake) {
+      credits~credit_to(src_addr, stake);
+    }
+    i += 1;
+  } until (l.null?());
+  throw_unless(49, tot_stake == best_stake);
+  return (credits, vset, tot_weight, frozen, tot_stake, m);
+}
+
+;; Helper to extract the credited amount for an address
+int get_credit(cell credits, int addr) {
+  var (val, f) = credits.udict_get?(256, addr);
+  if (f) {
+    return val~load_grams();
+  }
+  return 0;
+}
+
+;; Helper to extract the frozen amount for a pubkey
+int get_frozen(cell frozen, int pubkey) {
+  var (val, f) = frozen.udict_get?(256, pubkey);
+  if (f) {
+    val~skip_bits(256 + 64);
+    return val~load_grams();
+  }
+  return 0;
+}
+
+;; Test Method
+(int, int) poc_exploit(int original_stake, int max_stake) method_id {
+    cell credits = new_dict();
+    cell members = new_dict();
+
+    int pubkey1 = 0x1111;
+    int src_addr1 = 0xAAAA;
+
+    ;; Set up members dictionary with original_stake
+    ;; .store_grams(msg_value).store_uint(now(), 32).store_uint(max_factor, 32).store_uint(src_addr, 256).store_uint(adnl_addr, 256)
+    members~udict_set_builder(256, pubkey1, begin_cell()
+        .store_grams(original_stake)
+        .store_uint(1000, 32)
+        .store_uint(100000, 32) ;; max_factor
+        .store_uint(src_addr1, 256)
+        .store_uint(0, 256));
+
+    int min_stake = 10000;
+    int min_total_stake = 10000;
+    int max_stake_factor = 100000;
+
+    var (credits_after, vset, tot_weight, frozen, tot_stake, m) = try_elect(credits, members, min_stake, max_stake, min_total_stake, max_stake_factor);
+
+    int frozen_amount = get_frozen(frozen, pubkey1);
+    int refunded_amount = get_credit(credits_after, src_addr1);
+
+    int total_accounted = frozen_amount + refunded_amount;
+    int lost_amount = original_stake - total_accounted;
+
+    return (total_accounted, lost_amount);
+}
+
+() recv_internal(int msg_value, cell in_msg_cell, slice in_msg) impure {
+    ;; do nothing
+}
